@@ -5,17 +5,33 @@ import numpy as np
 from datetime import datetime, timedelta
 
 from portfolio_engine import (
+    # Rotation & predictive
     sector_strength_and_momentum, predictive_layer_bias, apply_predictive_bias_to_sectors, rotation_fund_flow,
+    # Risk-aware sector tools
     sector_correlations, risk_adjust_sector_bias,
-    portfolio_beta, portfolio_vol_vares, sector_risk_attribution, atr, position_size_by_risk, stops_targets, bollinger_bands, proximity_52w, backtest_signals,
+    # Portfolio analytics
+    portfolio_beta, portfolio_vol_vares, sector_risk_attribution, portfolio_weights_current,
+    # Tech indicators & helpers
+    atr, position_size_by_risk, stops_targets, bollinger_bands, proximity_52w, backtest_signals,
+    # Base datasets & metadata
     MID_D, MID_DV, ensure_portfolio_df, enrich_metadata,
+    # Data adapters
     fetch_live_prices, fetch_current_prices, get_news_yf, get_news_newsapi, fetch_earnings_calendar,
+    # Summaries & caps
     summarize_portfolio, sector_caps_ok, position_caps_ok,
+    # TA core
     compute_fibs_12m, compute_macd, compute_rsi, compute_adx, weighted_entry_zone,
+    # Seasonality
     monthly_seasonality, strong_weak_months, seasonality_by_sector,
+    # Risk scoring & composite
     simple_sentiment, risk_score, composite_rank_row,
+    # Rebalancer
     rebalance_plan_usd, sector_position_targets_biased,
-    init_db, log_signal, fetch_signals, evaluate_signals
+    # Signals DB
+    init_db, log_signal, fetch_signals, evaluate_signals,
+    # Factors / Optimizer / Stress / MC / Notes / Alerts
+    factor_exposure, mean_variance_opt, cap_constrain, shock_scenarios, monte_carlo_projection,
+    init_notes, add_note, fetch_notes, alerts_for_ticker
 )
 
 st.set_page_config(page_title="Portfolio Strategy App – v6.2 (USD)", layout="wide")
