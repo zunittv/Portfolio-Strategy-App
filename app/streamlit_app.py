@@ -1,4 +1,9 @@
-
+# --- robust import shim (works on Streamlit Cloud & locally)
+import os, sys
+HERE = os.path.dirname(__file__)
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+    
 import streamlit as st
 import pandas as pd
 import numpy as np
