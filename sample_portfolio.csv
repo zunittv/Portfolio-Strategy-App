@@ -1,0 +1,7 @@
+ticker,company,sector,allocation_cad,purchase_date,purchase_price
+AAPL,Apple Inc.,Technology,220,2025-06-03,198.00
+MSFT,Microsoft Corp.,Technology,220,2025-06-10,510.00
+XOM,Exxon Mobil Corp.,Energy,176,2025-06-05,112.00
+PG,Procter & Gamble,Consumer Staples,176,2025-06-04,165.00
+NVDA,NVIDIA Corp.,Technology,220,2025-06-02,185.00
+JPM,JPMorgan Chase,Financials,176,2025-06-12,150.00
