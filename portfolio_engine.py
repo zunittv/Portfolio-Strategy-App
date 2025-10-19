@@ -537,3 +537,582 @@ def evaluate_signals(signals_df: pd.DataFrame, horizons = {"1d":1, "1w":5, "1m":
 def ensure_portfolio_df(preset="Mid-D") -> pd.DataFrame:
     rows = MID_D if preset=="Mid-D" else MID_DV
     return pd.DataFrame([{"ticker":t,"company":c,"sector":s,"allocation_usd":0.0,"shares_held":0.0,"purchase_date":"","purchase_price":""} for t,c,s in rows])
+
+
+# -------- Metadata enrichment (ticker -> company, sector) --------
+
+def enrich_metadata(tickers: List[str]) -> Dict[str, Dict[str,str]]:
+    \"\"\"Return dict[ticker] = {company, sector} using yfinance.
+    Tries to be resilient to missing fields.\"\"\"
+    out = {}
+    for t in tickers:
+        if not t: 
+            continue
+        try:
+            info = yf.Ticker(t).get_info()
+        except Exception:
+            info = {}
+        company = info.get("longName") or info.get("shortName") or info.get("symbol") or t
+        sector = info.get("sector") or info.get("industry") or "Unknown"
+        out[t] = {"company": company, "sector": sector}
+    return out
+
+
+# =========================
+# Additional Indicators & Analytics
+# =========================
+
+def bollinger_bands(df_t: pd.DataFrame, period=20, n_std=2.0):
+    d = df_t.sort_values('date').copy()
+    if len(d) < period: 
+        return np.nan, np.nan, np.nan
+    ma = d['close'].rolling(period).mean()
+    std = d['close'].rolling(period).std()
+    upper = ma + n_std*std
+    lower = ma - n_std*std
+    return float(lower.iloc[-1]), float(ma.iloc[-1]), float(upper.iloc[-1])
+
+def proximity_52w(df_t: pd.DataFrame):
+    d = df_t.tail(252).copy()
+    if d.empty: return np.nan, np.nan, np.nan
+    hi = d['close'].max(); lo = d['close'].min(); last = d['close'].iloc[-1]
+    up = (hi-last)/last if last else np.nan
+    down = (last-lo)/last if last else np.nan
+    pct_band = (last - lo)/(hi - lo) if (hi - lo) else np.nan
+    return float(hi), float(lo), float(pct_band)
+
+def days_to_earnings(cal_df: pd.DataFrame, ticker: str):
+    if cal_df is None or cal_df.empty: return np.nan
+    now = pd.Timestamp.utcnow().normalize()
+    fut = cal_df[(cal_df['ticker']==ticker) & (cal_df['date']>=now)]
+    if fut.empty: return np.nan
+    dt = fut['date'].min()
+    return (dt - now).days
+
+def portfolio_weights_current(by_stock_df: pd.DataFrame):
+    cur_total = by_stock_df['current_value_usd'].sum()
+    if cur_total <= 0: 
+        return {r['ticker']:0.0 for _,r in by_stock_df.iterrows()}
+    return {r['ticker']: (r['current_value_usd']/cur_total) for _, r in by_stock_df.iterrows()}
+
+def portfolio_beta(px: pd.DataFrame, weights: dict, bench: pd.DataFrame):
+    # simple weighted beta using per-ticker beta_vs_benchmark over 60d
+    betas = {}
+    for t in weights:
+        df_t = px[px['ticker']==t]
+        b = beta_vs_benchmark(df_t, bench, period=60)
+        if pd.isna(b): b = 1.0
+        betas[t] = b
+    return sum(weights[t]*betas[t] for t in weights)
+
+def portfolio_vol_vares(px: pd.DataFrame, weights: dict, level=0.95):
+    # historical daily returns aggregation over last 252d
+    if px.empty or not weights: 
+        return np.nan, np.nan, np.nan
+    dates = sorted(px['date'].unique())
+    if len(dates) < 60: 
+        return np.nan, np.nan, np.nan
+    # pivot to wide closes
+    w = px.pivot_table(index='date', columns='ticker', values='close').dropna(axis=0, how='any')
+    rets = w.pct_change().dropna()
+    port_ret = rets.dot(pd.Series(weights).reindex(w.columns).fillna(0.0))
+    vol = float(port_ret.std())
+    # VaR / ES (daily, historical, left tail)
+    q = np.quantile(port_ret, 1-level)
+    var = float(-q)
+    es = float(-port_ret[port_ret <= q].mean()) if (port_ret <= q).any() else np.nan
+    return vol, var, es
+
+def sector_risk_attribution(by_stock_df: pd.DataFrame, px: pd.DataFrame):
+    # attribute by sector using simple stdev of sector sub-portfolio daily returns
+    if px.empty or by_stock_df.empty:
+        return pd.DataFrame(columns=['sector','risk_contrib'])
+    w = portfolio_weights_current(by_stock_df)
+    sectors = by_stock_df.set_index('ticker')['sector'].to_dict()
+    wide = px.pivot_table(index='date', columns='ticker', values='close').dropna(axis=0, how='any')
+    rets = wide.pct_change().dropna()
+    sec_weights = {}
+    for t, wt in w.items():
+        sec = sectors.get(t, 'Unknown')
+        sec_weights[sec] = sec_weights.get(sec, 0.0) + wt
+    # normalize
+    ssum = sum(sec_weights.values()) or 1.0
+    sec_weights = {k:v/ssum for k,v in sec_weights.items()}
+    # estimate sector vol as weighted stdev of members (crude)
+    sectors_list = sorted(set(sectors.values()))
+    rows = []
+    for s in sectors_list:
+        members = [t for t in w if sectors.get(t)==s]
+        if not members: 
+            continue
+        sub = rets[members].mean(axis=1)  # equal within sector
+        rows.append({'sector': s, 'risk_contrib': float(sub.std()*sec_weights.get(s,0.0))})
+    return pd.DataFrame(rows).sort_values('risk_contrib', ascending=False)
+
+# =========================
+# Position Sizing (Risk Budget)
+# =========================
+
+def atr(df_t: pd.DataFrame, period=14):
+    if df_t.empty: return np.nan
+    d = df_t.copy()
+    d['prev_close'] = d['close'].shift(1)
+    tr1 = d['high'] - d['low']
+    tr2 = (d['high'] - d['prev_close']).abs()
+    tr3 = (d['low'] - d['prev_close']).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    return float(tr.rolling(period).mean().iloc[-1])
+
+def position_size_by_risk(total_usd: float, per_trade_risk_bps: float, last_price: float, atr_val: float, atr_mult: float=1.5, min_shares: int=0):
+    # risk per share = ATR * atr_mult; target $ risk per trade = total_usd * per_trade_risk_bps
+    if not last_price or not atr_val or np.isnan(atr_val): 
+        return 0
+    risk_per_share = atr_val * atr_mult
+    risk_dollars = total_usd * (per_trade_risk_bps/10000.0)
+    shares = int(max(min_shares, risk_dollars / risk_per_share)) if risk_per_share>0 else 0
+    return shares
+
+def stops_targets(last_price: float, atr_val: float, fibs: dict, r_mult: float=2.0, atr_mult_stop: float=1.5):
+    if not last_price or not atr_val or np.isnan(atr_val): 
+        return {"stop": np.nan, "take_profit": np.nan}
+    stop = last_price - atr_mult_stop*atr_val
+    # take profit near next fib resistance if available; fallback to R multiple
+    res = max([fibs.get(k, np.nan) for k in ["38.2","23.6"] if pd.notna(fibs.get(k, np.nan))] or [np.nan])
+    if pd.isna(res) or res <= last_price:
+        tp = last_price + r_mult*atr_mult_stop*atr_val
+    else:
+        tp = res
+    return {"stop": float(stop), "take_profit": float(tp)}
+
+# =========================
+# Backtest-lite (1y)
+# =========================
+
+def backtest_signals(df_t: pd.DataFrame):
+    # Rule: Buy when MACD bullish AND price <= weighted_entry; Sell when MACD bearish OR hit take profit
+    if df_t.empty: 
+        return {"trades":0, "avg_ret":np.nan, "win_rate":np.nan}
+    d = df_t.sort_values('date').copy()
+    fibs = compute_fibs_12m(d)
+    latest = d.iloc[-1]['close']
+    wz = weighted_entry_zone(latest, fibs)
+    macd_df = compute_macd(d)
+    macd_df = macd_df.set_index('date')
+    # simple walk forward
+    closes = d.set_index('date')['close']
+    buy = False; entry=0.0; pnl=[]; tp = stops_targets(latest, atr(d), fibs)['take_profit']
+    for dt, px in closes.tail(252).items():
+        # macd signal
+        idx = macd_df.index.get_loc(dt, method='nearest') if not macd_df.empty else None
+        if idx is not None and idx>0:
+            prev = macd_df.iloc[idx-1]['macd'] - macd_df.iloc[idx-1]['macd_signal']
+            last = macd_df.iloc[idx]['macd'] - macd_df.iloc[idx]['macd_signal']
+            bull = prev<=0 and last>0
+            bear = prev>=0 and last<0
+        else:
+            bull = bear = False
+        if not buy:
+            if bull and (px <= (wz['weighted_entry'] if not np.isnan(wz['weighted_entry']) else px)):
+                buy=True; entry=px
+        else:
+            if bear or (tp and px>=tp):
+                pnl.append((px-entry)/entry)
+                buy=False; entry=0.0
+    trades = len(pnl)
+    avg_ret = float(np.mean(pnl)) if pnl else np.nan
+    win_rate = float(np.mean([1 if x>0 else 0 for x in pnl])) if pnl else np.nan
+    return {"trades":trades, "avg_ret":avg_ret, "win_rate":win_rate}
+
+
+# =========================
+# Risk-aware Bias Helpers
+# =========================
+
+def ewma_vol(series: pd.Series, lam: float=0.94):
+    r = series.pct_change().dropna()
+    if r.empty: return np.nan
+    var = 0.0
+    for x in r[::-1]:
+        var = lam*var + (1-lam)*(x**2)
+    return float(np.sqrt(var))
+
+def sector_correlations(px: pd.DataFrame, mapping: pd.DataFrame):
+    if px.empty or mapping.empty:
+        return pd.DataFrame()
+    wide = px.pivot_table(index='date', columns='ticker', values='close').dropna(axis=0, how='any')
+    rets = wide.pct_change().dropna()
+    sec_map = mapping.set_index('ticker')['sector'].to_dict()
+    # aggregate to sector equal-weight returns
+    sectors = sorted(set(sec_map.values()))
+    sec_ret = {}
+    for s in sectors:
+        members = [t for t,v in sec_map.items() if v==s and t in rets.columns]
+        if not members: 
+            continue
+        sec_ret[s] = rets[members].mean(axis=1)
+    if not sec_ret:
+        return pd.DataFrame()
+    df = pd.DataFrame(sec_ret).dropna()
+    return df.corr()
+
+def risk_adjust_sector_bias(sector_bias: Dict[str,float], px: pd.DataFrame, mapping: pd.DataFrame, lam: float=0.94):
+    # Down-weight sectors with higher EWMA volatility; neutralize extreme correlations by capping bias
+    if px.empty or mapping.empty:
+        return sector_bias
+    wide = px.pivot_table(index='date', columns='ticker', values='close').dropna(axis=0, how='any')
+    rets = wide.pct_change().dropna()
+    sec_map = mapping.set_index('ticker')['sector'].to_dict()
+    sectors = sorted(set(sec_map.values()))
+    vol_sec = {}
+    for s in sectors:
+        members = [t for t,v in sec_map.items() if v==s and t in wide.columns]
+        if not members:
+            continue
+        eq = rets[members].mean(axis=1)
+        vol_sec[s] = ewma_vol(eq, lam=lam)
+    # Normalize vol to [0.8, 1.2] scaling (lower vol -> >1 bias, higher vol -> <1 bias)
+    vols = [v for v in vol_sec.values() if v is not None and not np.isnan(v)]
+    if not vols:
+        return sector_bias
+    vmin, vmax = min(vols), max(vols)
+    adj = {}
+    for s,b in sector_bias.items():
+        v = vol_sec.get(s, np.nan)
+        if np.isnan(v) or vmax==vmin:
+            adj[s] = b
+        else:
+            scale = 1.2 - 0.4*((v - vmin)/(vmax - vmin))  # maps to [0.8,1.2]
+            adj[s] = float(b*scale)
+    # Clamp to [0.5, 1.5]
+    return {k: max(0.5, min(1.5, v)) for k,v in adj.items()}
+
+
+# =========================
+# Sector Rotation & Predictive Layer
+# =========================
+
+SECTOR_SPIDER_MAP = {
+    "Technology": "XLK",
+    "Communication Services": "XLC",
+    "Consumer Discretionary": "XLY",
+    "Consumer Staples": "XLP",
+    "Energy": "XLE",
+    "Financials": "XLF",
+    "Healthcare": "XLV",
+    "Industrials": "XLI",
+    "Materials": "XLB",
+    "Utilities": "XLU",
+    "Real Estate": "XLRE",
+    # Fallbacks / aliases
+    "Biotech": "XLV",
+    "Gold/Precious Metals": "XLB",
+    "Crypto/FinTech": "XLF",
+    "Travel/Airlines": "XLI",
+    "Small-Caps/High Beta": "IWM",
+    "Energy/Refining": "XLE"
+}
+
+EARLY_CYCLE = {"Technology","Communication Services","Consumer Discretionary","Industrials","Materials","Small-Caps/High Beta"}
+LATE_CYCLE  = {"Utilities","Healthcare","Consumer Staples","Energy","Real Estate"}
+
+def map_sector_etf(sector: str) -> str:
+    return SECTOR_SPIDER_MAP.get(sector, "SPY")
+
+def sector_strength_and_momentum(px: pd.DataFrame, mapping: pd.DataFrame, lookback_days: int = 30):
+    \"\"\"Compute sector relative strength vs SPY and momentum over lookback.\"\"\"
+    if px.empty or mapping.empty:
+        return pd.DataFrame(columns=[\"sector\",\"rs\",\"momentum\"])
+    sectors = mapping[\"sector\"].dropna().unique().tolist()
+    # fetch SPY
+    spy = fetch_live_prices([\"SPY\"], period=\"1y\", interval=\"1d\")
+    spy = spy.rename(columns={\"close\":\"spy_close\"})[[\"date\",\"spy_close\"]].drop_duplicates(\"date\")
+    rows = []
+    for s in sectors:
+        etf = map_sector_etf(s)
+        etf_px = fetch_live_prices([etf], period=\"1y\", interval=\"1d\")
+        if etf_px.empty or spy.empty:
+            rows.append({\"sector\":s, \"rs\":np.nan, \"momentum\":np.nan, \"etf\":etf})
+            continue
+        e = etf_px.rename(columns={\"close\":\"etf_close\"})[[\"date\",\"etf_close\"]].drop_duplicates(\"date\")
+        j = pd.merge(e, spy, on=\"date\", how=\"inner\").dropna()
+        if len(j) < lookback_days+5:
+            rows.append({\"sector\":s, \"rs\":np.nan, \"momentum\":np.nan, \"etf\":etf})
+            continue
+        # RS: last 20d return of sector minus SPY
+        j[\"ret_etf\"] = j[\"etf_close\"].pct_change()
+        j[\"ret_spy\"] = j[\"spy_close\"].pct_change()
+        rs = (1 + j[\"ret_etf\"].tail(20)).prod() - (1 + j[\"ret_spy\"].tail(20)).prod()
+        # Momentum: simple 30d sector return
+        mom = (j[\"etf_close\"].iloc[-1] / j[\"etf_close\"].iloc[-lookback_days]) - 1.0
+        rows.append({\"sector\":s, \"rs\":float(rs), \"momentum\":float(mom), \"etf\":etf})
+    return pd.DataFrame(rows)
+
+def predictive_layer_bias():
+    \"\"\"Fetch macro proxies and return sector bias multipliers based on regime.
+       - VIX regime: low (<15) neutral/slight risk-on, high (>25) risk-off
+       - Yield curve: 10y (^TNX) - 2y (^UST2Y or proxy ^FVX 5y) -> steepening risk-on, inversion risk-off
+    \"\"\"
+    try:
+        vix_df = fetch_live_prices([\"^VIX\"], period=\"6mo\", interval=\"1d\")
+        vix = float(vix_df[vix_df[\"ticker\"]==\"^VIX\"][\"close\"].iloc[-1]) if not vix_df.empty else np.nan
+    except Exception:
+        vix = np.nan
+    try:
+        tnx = fetch_live_prices([\"^TNX\"], period=\"6mo\", interval=\"1d\")
+        fvx = fetch_live_prices([\"^FVX\"], period=\"6mo\", interval=\"1d\")  # 5Y as proxy
+        y10 = float(tnx[tnx[\"ticker\"]==\"^TNX\"][\"close\"].iloc[-1]) if not tnx.empty else np.nan
+        y5  = float(fvx[fvx[\"ticker\"]==\"^FVX\"][\"close\"].iloc[-1]) if not fvx.empty else np.nan
+        curve = y10 - y5 if not (np.isnan(y10) or np.isnan(y5)) else np.nan
+    except Exception:
+        curve = np.nan
+
+    # Default neutral biases (1.0)
+    bias = {\"risk_on\":1.0, \"risk_off\":1.0, \"neutral\":1.0}
+    # VIX rule
+    if not np.isnan(vix):
+        if vix <= 15:       # calm
+            bias[\"risk_on\"] *= 1.05
+        elif vix >= 25:     # high vol
+            bias[\"risk_off\"] *= 1.10
+    # Yield curve rule
+    if not np.isnan(curve):
+        if curve > 0.0:     # steepening
+            bias[\"risk_on\"] *= 1.05
+        else:               # flat/inverted
+            bias[\"risk_off\"] *= 1.05
+    return bias
+
+def apply_predictive_bias_to_sectors(sector_bias: Dict[str,float], sectors: List[str]) -> Dict[str,float]:
+    \"\"\"Map macro regime bias to sector multipliers: overweight early-cycle in risk-on,
+       overweight defensives in risk-off.\"\"\"
+    regime = predictive_layer_bias()
+    out = {}
+    for s in sectors:
+        b = sector_bias.get(s, 1.0)
+        if s in EARLY_CYCLE:
+            b *= regime.get(\"risk_on\", 1.0)
+        elif s in LATE_CYCLE:
+            b *= regime.get(\"risk_off\", 1.0)
+        else:
+            b *= regime.get(\"neutral\", 1.0)
+        out[s] = float(max(0.5, min(1.6, b)))
+    return out
+
+def rotation_fund_flow(perf_by_sector: pd.DataFrame,
+                       plan_by_pos: pd.DataFrame,
+                       sector_scores: pd.DataFrame,
+                       add_threshold: float = -0.05,
+                       trim_threshold: float = 0.05,
+                       max_moves: int = 5):
+    \"\"\"Create a fund flow plan:
+       - Sources: positions with suggested_delta_usd < 0 or that have gained >= +5% vs purchase (if available)
+       - Destinations: positions with suggested_delta_usd > 0 or sectors/stocks down <= -5%
+       - Allocate flow proportionally to attractiveness (sector rs+momentum normalized)
+    \"\"\"
+    flows = []
+    if plan_by_pos.empty:
+        return pd.DataFrame(columns=[\"from\",\"to\",\"usd\",\"reason\"])
+    # Identify sources/destinations
+    sources = plan_by_pos[plan_by_pos[\"suggested_delta_usd\"] < 0].copy()
+    dests   = plan_by_pos[plan_by_pos[\"suggested_delta_usd\"] > 0].copy()
+    # Score destinations by sector scores
+    sec_score_map = {}
+    for _, r in sector_scores.iterrows():
+        s = r[\"sector\"]; rs = r.get(\"rs\", 0.0); mom = r.get(\"momentum\",0.0)
+        sec_score_map[s] = float( max(-1.0, min(1.0, 0.5*rs + 0.5*mom)) )
+    total_score = sum(max(0.0, sec_score_map.get(s,0.0)) for s in dests[\"sector\"]) or 1.0
+    # Build flows
+    for _, src in sources.head(max_moves).iterrows():
+        amt = abs(float(src[\"suggested_delta_usd\"]))  # USD to free
+        # distribute to dests proportionally by sector score
+        for _, dst in dests.head(max_moves).iterrows():
+            s = dst[\"sector\"]
+            w = max(0.0, sec_score_map.get(s,0.0)) / total_score
+            usd = amt * w
+            if usd <= 1e-6: 
+                continue
+            flows.append({
+                \"from\": f\"{src['ticker']} ({src['sector']})\",
+                \"to\":   f\"{dst['ticker']} ({dst['sector']})\",
+                \"usd\": float(usd),
+                \"reason\": f\"Rotate from trim source to higher-scored sector {s} (rs/mom)\"
+            })
+    return pd.DataFrame(flows)
+
+# =========================
+# Alerts, Factors, Optimizer, Stress/MC, Notes
+# =========================
+
+def pct_change_last(df_t: pd.DataFrame, days=1):
+    d = df_t.sort_values('date').tail(days+1).copy()
+    if len(d) < days+1: return np.nan
+    return float(d['close'].pct_change().iloc[-1])
+
+def macd_cross_signal(df_t: pd.DataFrame):
+    macd_df = compute_macd(df_t)
+    return macd_df.attrs.get('crossover','none')
+
+def earnings_proximity_flag(cal_df: pd.DataFrame, ticker: str, window_days=3):
+    dte = days_to_earnings(cal_df, ticker)
+    if np.isnan(dte): return False
+    return dte <= window_days
+
+def alerts_for_ticker(df_t: pd.DataFrame, bench: pd.DataFrame, headlines, cal_df: pd.DataFrame, ticker: str, price_chg_thresh=0.03, risk_thresh=7.0):
+    if df_t.empty: 
+        return []
+    alerts = []
+    chg1d = pct_change_last(df_t, days=1)
+    if not np.isnan(chg1d) and abs(chg1d) >= price_chg_thresh:
+        alerts.append(f"Price move {chg1d:.2%} (≥ {price_chg_thresh:.0%})")
+    cross = macd_cross_signal(df_t)
+    if cross in ['bullish','bearish']:
+        alerts.append(f"MACD {cross} crossover")
+    rscore = risk_score(df_t, bench, headlines)
+    if not np.isnan(rscore) and rscore >= risk_thresh:
+        alerts.append(f"High risk score {rscore:.1f} (≥ {risk_thresh})")
+    if earnings_proximity_flag(cal_df, ticker, window_days=3):
+        alerts.append("Earnings ≤ 3 days (event risk)")
+    return alerts
+
+def factor_matrix(px: pd.DataFrame):
+    """Return factor returns DataFrame using proxies: SPY, QQQ (growth), IWM (size), TLT (rates), GLD (gold), USO (oil), UUP (USD)."""
+    fac_tickers = ['SPY','QQQ','IWM','TLT','GLD','USO','UUP']
+    fac = fetch_live_prices(fac_tickers, period='2y', interval='1d')
+    if fac.empty or px.empty: return pd.DataFrame()
+    w = fac.pivot_table(index='date', columns='ticker', values='close').dropna()
+    return w.pct_change().dropna()
+
+def factor_exposure(px: pd.DataFrame, ticker: str):
+    import numpy as np
+    w = px.pivot_table(index='date', columns='ticker', values='close').dropna()
+    if ticker not in w.columns: 
+        return {}
+    r = w.pct_change().dropna()
+    y = r[ticker].copy()
+    Xf = factor_matrix(px)
+    if Xf.empty:
+        return {}
+    df = y.to_frame('y').join(Xf, how='inner').dropna()
+    if df.empty: return {}
+    Y = df['y'].values
+    X = df.drop(columns=['y']).values
+    X = np.concatenate([np.ones((len(X),1)), X], axis=1)
+    beta = np.linalg.lstsq(X, Y, rcond=None)[0]
+    keys = ['alpha'] + list(df.drop(columns=['y']).columns)
+    return {k: float(v) for k,v in zip(keys,beta)}
+
+def mean_variance_opt(px: pd.DataFrame, tickers: list, target_risk: float = None, risk_aversion: float = 3.0):
+    """Simple analytic mean-variance (no shorting). Returns raw weights (not cap-constrained)."""
+    import numpy as np
+    w = px.pivot_table(index='date', columns='ticker', values='close').dropna()
+    cols = [t for t in tickers if t in w.columns]
+    if len(cols) < 2: 
+        return {t: (1.0 if i==0 else 0.0) for i,t in enumerate(cols)}
+    r = w[cols].pct_change().dropna()
+    mu = r.mean().values
+    cov = r.cov().values
+    inv = np.linalg.pinv(cov)
+    one = np.ones(len(cols))
+    w_raw = inv.dot(mu) / max(1e-8, risk_aversion)
+    w_long = np.clip(w_raw, 0, None)
+    if w_long.sum() == 0:
+        w_long = np.ones_like(w_long)
+    w_norm = w_long / w_long.sum()
+    return {t: float(w_norm[i]) for i,t in enumerate(cols)}
+
+def cap_constrain(weights: dict, sector_map: dict, pos_cap=0.05, sector_cap=0.20):
+    """Project weights into feasible region with simple iterative capping and renormalization."""
+    import copy
+    w = copy.deepcopy(weights)
+    for k in w:
+        if w[k] > pos_cap:
+            w[k] = pos_cap
+    def sec_sum(s):
+        return sum(w[t] for t,sec in sector_map.items() if sec==s and t in w)
+    changed = True
+    while changed:
+        changed = False
+        for s in set(sector_map.values()):
+            if sec_sum(s) > sector_cap + 1e-12:
+                members = [t for t,sec in sector_map.items() if sec==s and t in w]
+                total = sum(w[t] for t in members)
+                if total>0:
+                    scale = sector_cap/total
+                    for t in members:
+                        w[t] *= scale
+                    changed = True
+    tot = sum(w.values())
+    if tot>0:
+        w = {k: v/tot for k,v in w.items()}
+    return w
+
+def shock_scenarios(px: pd.DataFrame, weights: dict):
+    """Return dict of scenario -> estimated portfolio change using factor proxies."""
+    fac = factor_matrix(px)
+    if fac.empty or not weights:
+        return {}
+    w = px.pivot_table(index='date', columns='ticker', values='close').dropna()
+    r = w.pct_change().dropna()
+    port = r.dot(pd.Series(weights).reindex(w.columns).fillna(0.0))
+    df = port.to_frame('y').join(fac, how='inner').dropna()
+    if df.empty: return {}
+    Y = df['y'].values
+    import numpy as np
+    X = df.drop(columns=['y']).values
+    X = np.concatenate([np.ones((len(X),1)), X], axis=1)
+    beta = np.linalg.lstsq(X, Y, rcond=None)[0]
+    keys = ['alpha'] + list(df.drop(columns=['y']).columns)
+    b = {k: float(v) for k,v in zip(keys,beta)}
+    scenarios = {
+        "Market -10% (SPY)": -0.10 * b.get('SPY',0.8),
+        "Market +10% (SPY)":  0.10 * b.get('SPY',0.8),
+        "Oil +5% (USO)":      0.05 * b.get('USO',0.0),
+        "USD +10% (UUP)":     0.10 * b.get('UUP',0.0),
+        "Rates + (TLT -5%)": -0.05 * b.get('TLT',0.0),
+        "Gold +5% (GLD)":     0.05 * b.get('GLD',0.0)
+    }
+    return scenarios
+
+def monte_carlo_projection(px: pd.DataFrame, weights: dict, days=21, trials=1000):
+    import numpy as np
+    w = px.pivot_table(index='date', columns='ticker', values='close').dropna()
+    cols = [c for c in weights if c in w.columns]
+    if not cols:
+        return {}
+    r = w[cols].pct_change().dropna()
+    mu = r.mean().values
+    cov = r.cov().values
+    wv = np.array([weights[c] for c in cols])
+    mean_port = float(wv.dot(mu))
+    var_port = float(wv.dot(cov).dot(wv))
+    daily_draws = np.random.normal(mean_port, np.sqrt(var_port), size=(trials, days))
+    cum = (1+daily_draws).prod(axis=1) - 1.0
+    return {
+        "mean": float(np.mean(cum)),
+        "p05": float(np.quantile(cum, 0.05)),
+        "p50": float(np.quantile(cum, 0.50)),
+        "p95": float(np.quantile(cum, 0.95))
+    }
+
+def init_notes(db_path: str = "data/app.db"):
+    import os
+    os.makedirs("data", exist_ok=True)
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT, ticker TEXT, note TEXT)")
+    conn.commit()
+    conn.close()
+
+def add_note(ticker: str, note: str, db_path: str = "data/app.db"):
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    ts = datetime.utcnow().isoformat()
+    cur.execute("INSERT INTO notes(timestamp,ticker,note) VALUES(?,?,?)", (ts, ticker, note))
+    conn.commit()
+    conn.close()
+
+def fetch_notes(db_path: str = "data/app.db") -> pd.DataFrame:
+    conn = sqlite3.connect(db_path)
+    df = pd.read_sql_query("SELECT * FROM notes ORDER BY id DESC", conn)
+    conn.close()
+    return df
